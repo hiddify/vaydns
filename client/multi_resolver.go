@@ -62,23 +62,28 @@ type resolverEntry struct {
 	addr net.Addr
 	conn net.PacketConn
 
-	validCount   atomic.Int64
-	invalidCount atomic.Int64
-	timeoutCount atomic.Int64
-
 	// dead is set when the entry's transport has reported an unrecoverable
 	// error and its reader goroutine has exited. A dead entry is permanently
 	// excluded from selection and never transitions back — the only way to
 	// recover is to rebuild the entire MultiResolver (which happens on a
-	// full tunnel reconnect).
+	// full tunnel reconnect). Kept as an atomic.Bool so selection helpers
+	// can read it without acquiring mu on the hot path.
 	dead atomic.Bool
 
-	mu        sync.Mutex
-	pending   map[uint16]time.Time
-	lastWrite time.Time
-	lastValid time.Time
-	lastProbe time.Time
-	state     ResolverState
+	// mu protects every field below. Counters are deliberately not atomic:
+	// the decay path in recomputeState would lose concurrent Adds if the
+	// counters were atomic and decremented via Load→Store, and splitting
+	// decay across a CAS loop is uglier than just holding mu for the
+	// short window each counter update requires.
+	mu           sync.Mutex
+	validCount   int64
+	invalidCount int64
+	timeoutCount int64
+	pending      map[uint16]time.Time
+	lastWrite    time.Time
+	lastValid    time.Time
+	lastProbe    time.Time
+	state        ResolverState
 }
 
 // markDead transitions the entry to a permanent Down state. It is idempotent
@@ -110,11 +115,11 @@ func (e *resolverEntry) writePacket(b []byte) (int, error) {
 	now := time.Now()
 	e.trackOutgoingID(b, now)
 	n, err := e.conn.WriteTo(b, e.addr)
-	if err != nil {
-		e.invalidCount.Add(1)
-	}
 	e.mu.Lock()
 	e.lastWrite = now
+	if err != nil {
+		e.invalidCount++
+	}
 	e.mu.Unlock()
 	return n, err
 }
@@ -140,50 +145,51 @@ func (e *resolverEntry) readPacket() multiReadResult {
 }
 
 func (e *resolverEntry) evaluateIncoming(packet []byte) {
+	now := time.Now()
 	resp, err := dns.MessageFromWireFormat(packet)
 	if err != nil {
-		e.invalidCount.Add(1)
-		e.recomputeState(time.Now())
+		e.mu.Lock()
+		e.invalidCount++
+		e.mu.Unlock()
+		e.recomputeState(now)
 		return
 	}
 
-	e.mu.Lock()
-	delete(e.pending, resp.ID)
-	e.mu.Unlock()
-
 	if isValidDNSResponse(resp) {
-		e.validCount.Add(1)
-		e.timeoutCount.Store(0)
 		e.mu.Lock()
-		e.lastValid = time.Now()
+		delete(e.pending, resp.ID)
+		e.validCount++
+		e.timeoutCount = 0
+		e.lastValid = now
 		e.state = ResolverStateHealthy
 		e.mu.Unlock()
 		return
 	}
 
-	e.invalidCount.Add(1)
+	e.mu.Lock()
+	delete(e.pending, resp.ID)
+	e.invalidCount++
 	if isRateLimitedResponse(resp) {
-		e.mu.Lock()
 		e.state = ResolverStateRateLimited
-		e.mu.Unlock()
 	}
-	e.recomputeState(time.Now())
+	e.mu.Unlock()
+	e.recomputeState(now)
 }
 
 func (e *resolverEntry) expirePending(now time.Time) {
-	expired := int64(0)
 	e.mu.Lock()
+	expired := int64(0)
 	for id, t := range e.pending {
 		if now.Sub(t) >= pendingResponseTimeout {
 			delete(e.pending, id)
 			expired++
 		}
 	}
-	e.mu.Unlock()
 	if expired > 0 {
-		e.timeoutCount.Add(expired)
-		e.invalidCount.Add(expired)
+		e.timeoutCount += expired
+		e.invalidCount += expired
 	}
+	e.mu.Unlock()
 	e.recomputeState(now)
 }
 
@@ -200,29 +206,25 @@ func (e *resolverEntry) recomputeState(now time.Time) {
 		return
 	}
 
-	timeouts := e.timeoutCount.Load()
-	invalid := e.invalidCount.Load()
-	valid := e.validCount.Load()
-
 	switch {
-	case timeouts >= downTimeoutThreshold:
+	case e.timeoutCount >= downTimeoutThreshold:
 		e.state = ResolverStateDown
-	case invalid >= rateLimitThreshold && valid == 0:
+	case e.invalidCount >= rateLimitThreshold && e.validCount == 0:
 		e.state = ResolverStateRateLimited
-	case valid > 0 && now.Sub(e.lastValid) <= 30*time.Second:
+	case e.validCount > 0 && now.Sub(e.lastValid) <= 30*time.Second:
 		e.state = ResolverStateHealthy
-	case valid == 0:
+	case e.validCount == 0:
 		e.state = ResolverStateUnknown
 	default:
 		e.state = ResolverStateUnknown
 	}
 
 	// Slow decay to avoid sticky penalties.
-	if invalid > 0 {
-		e.invalidCount.Store(invalid - 1)
+	if e.invalidCount > 0 {
+		e.invalidCount--
 	}
-	if timeouts > 0 {
-		e.timeoutCount.Store(timeouts - 1)
+	if e.timeoutCount > 0 {
+		e.timeoutCount--
 	}
 }
 
@@ -250,9 +252,9 @@ func (e *resolverEntry) snapshot() ResolverStat {
 	return ResolverStat{
 		Address:      e.name,
 		State:        e.state,
-		ValidCount:   e.validCount.Load(),
-		InvalidCount: e.invalidCount.Load(),
-		TimeoutCount: e.timeoutCount.Load(),
+		ValidCount:   e.validCount,
+		InvalidCount: e.invalidCount,
+		TimeoutCount: e.timeoutCount,
 		LastWrite:    e.lastWrite,
 		LastValid:    e.lastValid,
 	}
@@ -568,8 +570,10 @@ func (mr *MultiResolver) selectBestScore() *resolverEntry {
 }
 
 func resolverScore(e *resolverEntry) int64 {
-	statePenalty := int64(0)
-	switch e.stateSnapshot() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var statePenalty int64
+	switch e.state {
 	case ResolverStateHealthy:
 		statePenalty = 0
 	case ResolverStateUnknown:
@@ -579,7 +583,7 @@ func resolverScore(e *resolverEntry) int64 {
 	case ResolverStateDown:
 		statePenalty = 30
 	}
-	return e.validCount.Load()*4 - e.invalidCount.Load()*2 - e.timeoutCount.Load()*3 - statePenalty
+	return e.validCount*4 - e.invalidCount*2 - e.timeoutCount*3 - statePenalty
 }
 
 func (mr *MultiResolver) selectProbeTarget(primary *resolverEntry) *resolverEntry {
@@ -621,7 +625,9 @@ func (mr *MultiResolver) ResolverStats() []ResolverStat {
 func (mr *MultiResolver) ValidInvalidCounts() map[string][2]int64 {
 	out := make(map[string][2]int64, len(mr.entries))
 	for _, e := range mr.entries {
-		out[e.name] = [2]int64{e.validCount.Load(), e.invalidCount.Load()}
+		e.mu.Lock()
+		out[e.name] = [2]int64{e.validCount, e.invalidCount}
+		e.mu.Unlock()
 	}
 	return out
 }
