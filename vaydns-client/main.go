@@ -238,10 +238,12 @@ Known TLS fingerprints for -utls are:
 		resolvers = append(resolvers, resolver)
 	}
 	for _, dotAddr := range dotAddrs {
-		resolvers = append(resolvers, client.Resolver{
+		resolver := client.Resolver{
 			ResolverType: client.ResolverTypeDOT,
 			ResolverAddr: dotAddr,
-		})
+		}
+		resolver.UTLSClientHelloID = utlsClientHelloID
+		resolvers = append(resolvers, resolver)
 	}
 	for _, udpAddr := range udpAddrs {
 		resolver := client.Resolver{
