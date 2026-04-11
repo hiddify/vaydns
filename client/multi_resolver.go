@@ -66,12 +66,44 @@ type resolverEntry struct {
 	invalidCount atomic.Int64
 	timeoutCount atomic.Int64
 
+	// dead is set when the entry's transport has reported an unrecoverable
+	// error and its reader goroutine has exited. A dead entry is permanently
+	// excluded from selection and never transitions back — the only way to
+	// recover is to rebuild the entire MultiResolver (which happens on a
+	// full tunnel reconnect).
+	dead atomic.Bool
+
 	mu        sync.Mutex
 	pending   map[uint16]time.Time
 	lastWrite time.Time
 	lastValid time.Time
 	lastProbe time.Time
 	state     ResolverState
+}
+
+// markDead transitions the entry to a permanent Down state. It is idempotent
+// and returns true only when this call was the one that transitioned the
+// entry — callers rely on this to avoid double-counting the entry in
+// MultiResolver.aliveCount when multiple goroutines detect the same transport
+// failure concurrently.
+//
+// The dead flag and the state field are set together under mu so that
+// recomputeState (also holding mu) cannot observe an inconsistent snapshot
+// where dead is set but state has not yet been transitioned to Down.
+func (e *resolverEntry) markDead() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.dead.Load() {
+		return false
+	}
+	e.dead.Store(true)
+	e.state = ResolverStateDown
+	return true
+}
+
+// isDead reports whether markDead has been called on this entry.
+func (e *resolverEntry) isDead() bool {
+	return e.dead.Load()
 }
 
 func (e *resolverEntry) writePacket(b []byte) (int, error) {
@@ -156,8 +188,17 @@ func (e *resolverEntry) expirePending(now time.Time) {
 }
 
 func (e *resolverEntry) recomputeState(now time.Time) {
+	// Dead is sticky — never recompute it back to any other state. We
+	// re-check under the lock after acquiring it, in case markDead raced
+	// in between the outer check and acquiring the lock.
+	if e.isDead() {
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.dead.Load() {
+		return
+	}
 
 	timeouts := e.timeoutCount.Load()
 	invalid := e.invalidCount.Load()
@@ -238,6 +279,15 @@ type MultiResolver struct {
 	recvChan  chan multiReadResult
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	// aliveCount tracks how many entries still have a live reader
+	// goroutine. When it reaches zero, allDead is closed, causing pending
+	// ReadFrom/WriteTo calls to return an "all resolvers down" error,
+	// which is the only condition that should propagate a transport
+	// error to the upper tunnel session.
+	aliveCount  atomic.Int32
+	allDead     chan struct{}
+	allDeadOnce sync.Once
 }
 
 // NewMultiResolver creates a MultiResolver from a slice of Resolver configs.
@@ -269,25 +319,57 @@ func NewMultiResolver(resolvers []Resolver, mode SelectionMode, queueSize int, o
 		mode:     mode,
 		recvChan: make(chan multiReadResult, len(entries)*4),
 		closed:   make(chan struct{}),
+		allDead:  make(chan struct{}),
 	}
-	for _, e := range entries {
+	mr.aliveCount.Store(int32(len(entries)))
+	mr.startReaders()
+	go mr.healthWorker()
+	return mr, nil
+}
+
+// entryDied is called whenever a transport error is observed for an entry,
+// either from its reader goroutine or from a failed write. It marks the entry
+// dead and, if this was the transition from alive to dead (as opposed to a
+// second observer of the same failure), decrements aliveCount. When the last
+// alive entry dies, allDead is closed so pending ReadFrom/WriteTo callers can
+// unblock with a terminal error.
+func (mr *MultiResolver) entryDied(entry *resolverEntry, err error) {
+	if !entry.markDead() {
+		return
+	}
+	log.Warnf("multi-resolver: entry %s transport error: %v; marking down", entry.name, err)
+	if mr.aliveCount.Add(-1) == 0 {
+		mr.allDeadOnce.Do(func() { close(mr.allDead) })
+	}
+}
+
+// startReaders launches one reader goroutine per entry. Each goroutine reads
+// packets from its entry's transport and pushes the result onto recvChan.
+// Extracted so tests can construct MultiResolver with synthetic entries.
+//
+// On a transport error, the reader calls entryDied to mark the entry dead and
+// signal allDead when the last entry dies. It never pushes error-bearing
+// results onto recvChan: doing so would surface a single resolver's failure
+// to DNSPacketConn.recvLoop, which would tear down the entire tunnel session
+// and defeat the point of having multiple resolvers.
+func (mr *MultiResolver) startReaders() {
+	for _, e := range mr.entries {
 		entry := e
 		go func() {
 			for {
 				res := entry.readPacket()
+				if res.err != nil {
+					mr.entryDied(entry, res.err)
+					return
+				}
 				select {
 				case mr.recvChan <- res:
 				case <-mr.closed:
 					return
 				}
-				if res.err != nil {
-					return
-				}
 			}
 		}()
 	}
-	go mr.healthWorker()
-	return mr, nil
 }
 
 func (mr *MultiResolver) healthWorker() {
@@ -350,32 +432,66 @@ func isRateLimitedResponse(resp dns.Message) bool {
 }
 
 // ReadFrom receives a packet from whichever resolver responds first.
+// It only returns an error when the MultiResolver has been closed or every
+// entry has died; a single resolver's transport error is isolated at the
+// reader goroutine and does not propagate here.
 func (mr *MultiResolver) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 	select {
 	case <-mr.closed:
 		return 0, nil, net.ErrClosed
 	case res := <-mr.recvChan:
-		if res.err != nil {
-			return 0, res.addr, res.err
-		}
 		n = copy(b, res.buf[:res.n])
 		return n, turbotunnel.DummyAddr{}, nil
+	case <-mr.allDead:
+		// Drain any packet that was buffered by a reader before it
+		// died, so packets already delivered by the transport are not
+		// discarded in favour of the terminal error. No more readers
+		// are pushing (allDead is closed only after every reader has
+		// exited), so a non-blocking read here races only with the
+		// mr.closed case above, which is handled on the next call.
+		select {
+		case res := <-mr.recvChan:
+			n = copy(b, res.buf[:res.n])
+			return n, turbotunnel.DummyAddr{}, nil
+		default:
+			return 0, nil, fmt.Errorf("multi-resolver: all resolvers are down")
+		}
 	}
 }
 
 // WriteTo sends b to the selected primary resolver and may duplicate b to one
-// unhealthy resolver as a probe to detect recovery.
+// unhealthy resolver as a probe to detect recovery. If the primary's write
+// fails, the entry is marked dead and WriteTo retries with the next alive
+// entry. An error is returned only when the MultiResolver is closed or every
+// entry has been marked dead.
 func (mr *MultiResolver) WriteTo(b []byte, _ net.Addr) (n int, err error) {
 	select {
 	case <-mr.closed:
 		return 0, net.ErrClosed
+	case <-mr.allDead:
+		return 0, fmt.Errorf("multi-resolver: all resolvers are down")
 	default:
 	}
 
-	primary := mr.selectPrimary()
-	n, err = primary.writePacket(b)
-	if err != nil {
-		return n, err
+	// Try entries until one accepts the write or all alive entries have
+	// been exhausted. Each write error marks the entry dead.
+	var primary *resolverEntry
+	for attempts := 0; attempts < len(mr.entries); attempts++ {
+		primary = mr.selectPrimary()
+		if primary == nil {
+			break
+		}
+		n, err = primary.writePacket(b)
+		if err == nil {
+			break
+		}
+		mr.entryDied(primary, err)
+	}
+	switch {
+	case err != nil:
+		return 0, fmt.Errorf("multi-resolver: all write attempts failed: %w", err)
+	case primary == nil:
+		return 0, fmt.Errorf("multi-resolver: no alive resolver for write")
 	}
 
 	if probe := mr.selectProbeTarget(primary); probe != nil {
@@ -385,17 +501,17 @@ func (mr *MultiResolver) WriteTo(b []byte, _ net.Addr) (n int, err error) {
 	return n, nil
 }
 
+// selectPrimary returns the entry that should receive the next outgoing
+// query, or nil if every entry has been marked dead. The caller must handle
+// nil (e.g., return an "all resolvers down" error).
 func (mr *MultiResolver) selectPrimary() *resolverEntry {
 	if mr.mode == SelectionRoundRobin {
-		if e := mr.selectRoundRobinHealthy(); e != nil {
-			return e
-		}
-		return mr.entries[0]
+		return mr.selectRoundRobinHealthy()
 	}
 	if e := mr.selectBestScore(); e != nil {
 		return e
 	}
-	return mr.entries[0]
+	return mr.selectRoundRobinHealthy()
 }
 
 func (mr *MultiResolver) selectRoundRobinHealthy() *resolverEntry {
@@ -407,28 +523,43 @@ func (mr *MultiResolver) selectRoundRobinHealthy() *resolverEntry {
 	}
 
 	start := mr.rrIndex
+	// First pass: prefer Healthy or Unknown, skipping dead entries.
 	for i := 0; i < len(mr.entries); i++ {
 		idx := (start + i) % len(mr.entries)
+		if mr.entries[idx].isDead() {
+			continue
+		}
 		state := mr.entries[idx].stateSnapshot()
 		if state == ResolverStateHealthy || state == ResolverStateUnknown {
 			mr.rrIndex = (idx + 1) % len(mr.entries)
 			return mr.entries[idx]
 		}
 	}
-	idx := start % len(mr.entries)
-	mr.rrIndex = (idx + 1) % len(mr.entries)
-	return mr.entries[idx]
+	// Second pass: accept any non-dead entry even if RateLimited/Down.
+	for i := 0; i < len(mr.entries); i++ {
+		idx := (start + i) % len(mr.entries)
+		if mr.entries[idx].isDead() {
+			continue
+		}
+		mr.rrIndex = (idx + 1) % len(mr.entries)
+		return mr.entries[idx]
+	}
+	// Every entry is dead.
+	return nil
 }
 
 func (mr *MultiResolver) selectBestScore() *resolverEntry {
 	if len(mr.entries) == 0 {
 		return nil
 	}
-	best := mr.entries[0]
-	bestScore := resolverScore(best)
-	for _, e := range mr.entries[1:] {
+	var best *resolverEntry
+	var bestScore int64
+	for _, e := range mr.entries {
+		if e.isDead() {
+			continue
+		}
 		s := resolverScore(e)
-		if s > bestScore {
+		if best == nil || s > bestScore {
 			best = e
 			bestScore = s
 		}
@@ -460,6 +591,9 @@ func (mr *MultiResolver) selectProbeTarget(primary *resolverEntry) *resolverEntr
 		idx := (mr.probeRR + i) % len(mr.entries)
 		e := mr.entries[idx]
 		if e == primary {
+			continue
+		}
+		if e.isDead() {
 			continue
 		}
 		state := e.stateSnapshot()
