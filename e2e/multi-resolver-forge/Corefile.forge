@@ -1,0 +1,6 @@
+. {
+    template IN ANY . {
+        rcode NXDOMAIN
+    }
+    log
+}
