@@ -39,12 +39,12 @@ import (
 
 // Default timeouts for VayDNS mode.
 const (
-	DefaultIdleTimeout          = 60 * time.Second
-	DefaultKeepAlive            = 10 * time.Second
+	DefaultIdleTimeout          = 10 * time.Second
+	DefaultKeepAlive            = 2 * time.Second
 	DefaultOpenStreamTimeout    = 10 * time.Second
 	DefaultReconnectDelay       = 1 * time.Second
 	DefaultReconnectMaxDelay    = 30 * time.Second
-	DefaultSessionCheckInterval = 20 * time.Second
+	DefaultSessionCheckInterval = 500 * time.Millisecond
 	DefaultUDPResponseTimeout   = 500 * time.Millisecond
 	DefaultUDPWorkers           = 100
 	DefaultMaxStreams           = 0 // unlimited
@@ -198,8 +198,8 @@ type Tunnel struct {
 	MaxStreams           int                           // default: 0 (0 = unlimited)
 	ReconnectMinDelay    time.Duration                 // default: 1s
 	ReconnectMaxDelay    time.Duration                 // default: 30s
-	SessionCheckInterval time.Duration                 // default: 20s
-	HandshakeTimeout     time.Duration                 // default: 30s
+	SessionCheckInterval time.Duration                 // default: 500ms
+	HandshakeTimeout     time.Duration                 // default: 15s
 	PacketQueueSize      int                           // default: QueueSize (512)
 	KCPWindowSize        int                           // default: PacketQueueSize/2
 	QueueOverflowMode    turbotunnel.QueueOverflowMode // default: drop

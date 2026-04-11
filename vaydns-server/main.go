@@ -1,26 +1,26 @@
-// dnstt-server is the server end of a DNS tunnel.
+// vaydns-server is the server end of a DNS tunnel.
 //
 // Usage:
 //
-//	dnstt-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
-//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] -domain DOMAIN -upstream UPSTREAMADDR
+//	vaydns-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
+//	vaydns-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] -domain DOMAIN -upstream UPSTREAMADDR
 //
 // Example:
 //
-//	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
-//	dnstt-server -udp :53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+//	vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
+//	vaydns-server -udp :53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 //
 // With fallback for non-DNS traffic:
 //
-//	dnstt-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 -domain t.example.com -upstream 127.0.0.1:8000
+//	vaydns-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 -domain t.example.com -upstream 127.0.0.1:8000
 //
 // To generate a persistent server private key, first run with the -gen-key
 // option. By default the generated private and public keys are printed to
 // standard output. To save them to files instead, use the -privkey-file and
 // -pubkey-file options.
 //
-//	dnstt-server -gen-key
-//	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
+//	vaydns-server -gen-key
+//	vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
 //
 // You can give the server's private key as a file or as a hex string.
 //
@@ -73,8 +73,8 @@ import (
 )
 
 const (
-	defaultIdleTimeout = 60 * time.Second
-	defaultKeepAlive   = 10 * time.Second
+	defaultIdleTimeout = 10 * time.Second
+	defaultKeepAlive   = 2 * time.Second
 	// Bound the pre-smux handshake so half-open KCP sessions cannot linger
 	// indefinitely and consume server resources.
 	defaultHandshakeTimeout = 15 * time.Second
@@ -421,6 +421,11 @@ func nextPacketDnstt(r *bytes.Reader) ([]byte, error) {
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
 func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+	responsePayloadSize := uint16(maxUDPPayload)
+	if int(responsePayloadSize) != maxUDPPayload {
+		responsePayloadSize = 0xffff
+	}
+
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -455,7 +460,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
 			Type:  dns.RRTypeOPT,
-			Class: 4096, // responder's UDP payload size
+			Class: responsePayloadSize, // responder's UDP payload size
 			TTL:   0,
 			Data:  []byte{},
 		})
@@ -778,6 +783,10 @@ func encodeResponsePayload(rec *record, data []byte, domain dns.Name) error {
 				Data:  chunk,
 			}
 		}
+	case dns.RRTypeNULL:
+		rec.Resp.Answer[0].Data = dns.EncodeRDataNULL(data)
+	case dns.RRTypeCAA:
+		rec.Resp.Answer[0].Data = dns.EncodeRDataCAA(data)
 	case dns.RRTypeCNAME:
 		rdata, err := dns.EncodeRDataCNAME(data, domain)
 		if err != nil {
@@ -941,15 +950,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 	return nil
 }
 
-// computeMaxEncodedPayload computes the maximum amount of downstream TXT RR
-// data that keep the overall response size less than maxUDPPayload, in the
+// computeMaxEncodedPayload computes the maximum amount of downstream single-RR
+// payload that keeps the overall response size less than maxUDPPayload, in the
 // worst case when the response answers a query that has a maximum-length name
 // in its Question section. Returns 0 in the case that no amount of data makes
 // the overall response size small enough.
 //
 // This function needs to be kept in sync with sendLoop with regard to how it
 // builds candidate responses.
-func computeMaxEncodedPayload(limit int) int {
+func computeMaxEncodedPayload(limit int, encode func([]byte) []byte) int {
 	// 64+64+64+62 octets, needs to be base32-decodable.
 	maxLengthName, err := dns.NewName([][]byte{
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -1014,7 +1023,7 @@ func computeMaxEncodedPayload(limit int) int {
 	high := 32768
 	for low+1 < high {
 		mid := (low + high) / 2
-		resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
+		resp.Answer[0].Data = encode(make([]byte, mid))
 		buf, err := resp.WireFormat()
 		if err != nil {
 			panic(err)
@@ -1136,8 +1145,12 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(maxUDPPayload, 4)
 	case dns.RRTypeAAAA:
 		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(maxUDPPayload, 16)
+	case dns.RRTypeNULL:
+		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataNULL)
+	case dns.RRTypeCAA:
+		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataCAA)
 	default:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload)
+		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataTXT)
 	}
 	// 2 bytes accounts for a packet length prefix.
 	mtu := maxEncodedPayload - 2
@@ -1194,7 +1207,10 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
 }
 
+var version = "dev"
+
 func main() {
+	var showVersion bool
 	var genKey bool
 	var domainArg string
 	var upstream string
@@ -1243,14 +1259,20 @@ Example:
 	flag.StringVar(&keepAliveStr, "keepalive", defaultKeepAlive.String(), "keepalive ping interval (e.g. 2s, 500ms); must be less than idle-timeout")
 	flag.BoolVar(&compatDnstt, "dnstt-compat", false, "use original dnstt wire format (8-byte ClientID, padding prefixes)")
 	flag.IntVar(&clientIDSize, "clientid-size", 2, "client ID size in bytes (ignored when -dnstt-compat is set)")
-	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS record type for downstream data (txt, cname, a, aaaa, mx, ns, srv)")
+	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS record type for downstream data (txt, null, cname, a, aaaa, mx, ns, srv, caa)")
 	flag.IntVar(&queueSize, "queue-size", turbotunnel.QueueSize, "packet queue size for DNS tunnel transport")
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", 0, "KCP send/receive window size in packets (0 = queue-size/2)")
 	flag.StringVar(&queueOverflowStr, "queue-overflow", string(turbotunnel.DefaultQueueOverflowMode), "queue overflow behavior: drop or block")
 
 	var logLevel string
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warning, error)")
+	flag.BoolVar(&showVersion, "v", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	level, err := log.ParseLevel(logLevel)
 	if err != nil {
@@ -1395,8 +1417,8 @@ Example:
 			fmt.Fprintf(os.Stderr, "-keepalive (%s) must be less than -idle-timeout (%s)\n", keepAlive, idleTimeout)
 			os.Exit(1)
 		}
-		if queueSize <= 0 {
-			fmt.Fprintf(os.Stderr, "-queue-size (%d) must be greater than 0\n", queueSize)
+		if queueSize < 32 {
+			fmt.Fprintf(os.Stderr, "-queue-size (%d) must be at least 32\n", queueSize)
 			os.Exit(1)
 		}
 		if kcpWindowSize < 0 {
@@ -1453,7 +1475,8 @@ Example:
 		}
 		log.Infof("wire config: clientid-size=%d compat=%v", wireConfig.ClientIDSize, wireConfig.Compat)
 
-		if recordType != dns.RRTypeTXT {
+		switch recordType {
+		case dns.RRTypeCNAME, dns.RRTypeNS, dns.RRTypeMX, dns.RRTypeSRV:
 			explicitFlags := make(map[string]bool)
 			flag.Visit(func(f *flag.Flag) {
 				explicitFlags[f.Name] = true

@@ -30,6 +30,9 @@ func (s *StringSliceFlag) Set(value string) error {
 	*s = append(*s, value)
 	return nil
 }
+
+var version = "dev"
+
 func readKeyFromFile(filename string) ([]byte, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -40,6 +43,7 @@ func readKeyFromFile(filename string) ([]byte, error) {
 }
 
 func main() {
+	var showVersion bool
 	var dohURLs StringSliceFlag
 	var dotAddrs StringSliceFlag
 	var domainArg string
@@ -78,7 +82,23 @@ Examples:
   %[1]s -dot resolver.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 
 `, os.Args[0])
-		flag.PrintDefaults()
+		flag.CommandLine.VisitAll(func(f *flag.Flag) {
+			if f.Name == "session-check-interval" {
+				return
+			}
+			fmt.Fprintf(flag.CommandLine.Output(), "  -%s", f.Name)
+			name, usage := flag.UnquoteUsage(f)
+			if len(name) > 0 {
+				fmt.Fprintf(flag.CommandLine.Output(), " %s", name)
+			}
+			if len(f.DefValue) > 0 {
+				fmt.Fprintf(flag.CommandLine.Output(), " (default %s)", f.DefValue)
+			}
+			if len(usage) > 0 {
+				fmt.Fprintf(flag.CommandLine.Output(), "\n    \t%s", usage)
+			}
+			fmt.Fprint(flag.CommandLine.Output(), "\n")
+		})
 		labels := make([]string, 0)
 		labels = append(labels, "none")
 		for _, entry := range client.UTLSClientHelloIDMap() {
@@ -127,14 +147,20 @@ Known TLS fingerprints for -utls are:
 	flag.BoolVar(&udpAcceptErrors, "udp-accept-errors", false, "accept DNS error responses instead of filtering them (disables censorship evasion)")
 	flag.BoolVar(&compatDnstt, "dnstt-compat", false, "use original dnstt wire format (8-byte ClientID, padding prefixes)")
 	flag.IntVar(&clientIDSize, "clientid-size", 2, "client ID size in bytes (ignored when -dnstt-compat is set)")
-	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS record type for downstream data (txt, cname, a, aaaa, mx, ns, srv)")
+	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS record type for downstream data (txt, null, cname, a, aaaa, mx, ns, srv, caa)")
 	flag.IntVar(&queueSize, "queue-size", turbotunnel.QueueSize, "packet queue size for transport and DNS layers")
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", 0, "KCP send/receive window size in packets (0 = queue-size/2)")
 	flag.StringVar(&queueOverflowStr, "queue-overflow", string(turbotunnel.DefaultQueueOverflowMode), "queue overflow behavior: drop or block")
 
 	var logLevel string
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warning, error)")
+	flag.BoolVar(&showVersion, "v", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	level, err := log.ParseLevel(logLevel)
 	if err != nil {

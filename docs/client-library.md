@@ -71,9 +71,12 @@ All configuration is done through struct fields before calling `Initiate*` or `L
 ```go
 // Resolver options
 r.UTLSClientHelloID = &utls.ClientHelloID{...} // TLS fingerprint
+r.RoundTripper = customTransport                // custom HTTP transport for DoH (overrides UTLSClientHelloID)
+r.DialerControl = controlFunc                   // socket options callback (SO_MARK, SO_BINDTODEVICE, etc.)
 r.UDPWorkers = 200                              // concurrent UDP workers
-r.UDPSharedSocket = true                         // single socket mode
-r.UDPTimeout = 500 * time.Millisecond            // per-query timeout
+r.UDPSharedSocket = true                        // single socket mode
+r.UDPTimeout = 500 * time.Millisecond           // per-query timeout
+r.UDPAcceptErrors = true                        // accept non-NOERROR responses (disables forged filtering)
 
 // Tunnel server options
 ts.DnsttCompat = true    // original dnstt wire format
@@ -81,12 +84,14 @@ ts.ClientIDSize = 1      // smaller ClientID
 ts.MaxQnameLen = 101     // QNAME length constraint
 ts.MaxNumLabels = 2      // label count constraint
 ts.RPS = 200             // rate limit queries/second
+ts.RecordType = "cname"  // DNS record type for downstream data: txt, null, cname, a, aaaa, mx, ns, srv, caa (default: "txt")
 
 // Session options
 t.IdleTimeout = 60 * time.Second
 t.KeepAlive = 10 * time.Second
+t.OpenStreamTimeout = 10 * time.Second
 t.MaxStreams = 256
-t.SessionCheckInterval = 20 * time.Second
+t.SessionCheckInterval = 500 * time.Millisecond
 t.ReconnectMinDelay = 1 * time.Second
 t.ReconnectMaxDelay = 30 * time.Second
 t.HandshakeTimeout = 15 * time.Second

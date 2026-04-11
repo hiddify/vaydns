@@ -130,12 +130,12 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-p
 | `-privkey HEX`       | Server private key as hex string                                  | —          |
 | `-gen-key`           | Generate a new keypair and exit                                   | —          |
 | `-mtu N`             | Max UDP payload size for responses                                | `1232`     |
-| `-idle-timeout D`    | Session idle timeout (must match client)                          | `60s`      |
-| `-keepalive D`       | Keepalive ping interval (must match client, must be < idle-timeout) | `10s`      |
+| `-idle-timeout D`    | Session idle timeout (must match client)                          | `10s`      |
+| `-keepalive D`       | Keepalive ping interval (must match client, must be < idle-timeout) | `2s`      |
 | `-fallback ADDR`     | UDP endpoint to forward non-DNS packets to (e.g. `127.0.0.1:8888`) | —          |
 | `-dnstt-compat`      | Use original dnstt wire format (8-byte ClientID, padding prefixes). Also sets `-idle-timeout` to 2m and `-keepalive` to 10s unless explicitly overridden. | `false`    |
 | `-clientid-size N`   | ClientID size in bytes (ignored when `-dnstt-compat` is set)       | `2`        |
-| `-record-type TYPE`  | DNS record type for downstream data: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Must match the client. Ignored (forced to `txt`) when `-dnstt-compat` is set. | `txt`      |
+| `-record-type TYPE`  | DNS record type for downstream data: `txt`, `null`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`, `caa`. Must match the client. Ignored (forced to `txt`) when `-dnstt-compat` is set. | `txt`      |
 | `-queue-size N`      | Packet queue size for transport and DNS layers                    | `512`      |
 | `-kcp-window-size N` | KCP send/receive window size in packets (0 = queue-size/2)        | `0`        |
 | `-queue-overflow MODE` | Queue overflow behavior: `drop` (silent discard) or `block` (backpressure) | `drop`     |
@@ -164,17 +164,16 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-p
 
 | Flag                        | Description                                        | Default |
 | --------------------------- | -------------------------------------------------- | ------- |
-| `-idle-timeout D`           | Session idle timeout (must match server)                                                    | `60s`   |
-| `-keepalive D`              | Keepalive ping interval (must match server, must be < idle-timeout)                         | `10s`   |
+| `-idle-timeout D`           | Session idle timeout (must match server)                                                    | `10s`   |
+| `-keepalive D`              | Keepalive ping interval (must match server, must be < idle-timeout)                         | `2s`   |
 | `-max-streams N`            | Max concurrent streams per session (0 = unlimited)                                          | `0`   |
 | `-open-stream-timeout D`    | Timeout for opening an smux stream                                                          | `10s`   |
 | `-reconnect-min D`          | Initial backoff delay for session reconnect                                                  | `1s`    |
 | `-reconnect-max D`          | Max backoff delay (must be >= reconnect-min)                                                 | `30s`   |
-| `-session-check-interval D` | How often to check if the session is alive (should be shorter than idle-timeout)              | `20s`   |
 
-> **Note:** `idle-timeout` and `keepalive` must be set to the same values on both client and server — mismatched values will cause one side to close the session before the other detects it. Keep `keepalive` well below `idle-timeout` (the default 6x ratio allows ~6 ping attempts before timeout).
+> **Note:** `idle-timeout` and `keepalive` must be set to the same values on both client and server — mismatched values will cause one side to close the session before the other detects it. Keep `keepalive` well below `idle-timeout` (the default 5x ratio allows ~5 ping attempts before timeout).
 >
-> `session-check-interval` controls how quickly the client detects a dead session and starts reconnecting — it does not affect when the session dies. A lower value means faster reconnection but can cause unnecessary churn on lossy networks. It does not need to match on client and server.
+> **How they relate:** `keepalive` controls how often smux sends ping frames to prove the session is alive. `idle-timeout` is how long smux waits with no received data (including pings) before declaring the session dead — it applies symmetrically on both sides.
 
 #### UDP transport tuning
 
@@ -225,7 +224,7 @@ These reduce upstream throughput but improve compatibility. The minimum effectiv
 | `-rps N`           | Rate limit outgoing DNS queries per second (0 = unlimited). Uses a token bucket with 1-second burst allowance. | `0`             |
 | `-dnstt-compat`    | Use original dnstt wire format (8-byte ClientID, padding prefixes). Sets `-max-qname-len` to 253 unless explicitly overridden. Forces `-record-type` to `txt` with a warning if another type is set. | `false`         |
 | `-clientid-size N` | ClientID size in bytes (ignored when `-dnstt-compat` is set) | `2`             |
-| `-record-type TYPE` | DNS record type for downstream data: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Must match the server. | `txt`           |
+| `-record-type TYPE` | DNS record type for downstream data: `txt`, `null`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`, `caa`. Must match the server. | `txt`           |
 | `-utls SPEC`       | TLS fingerprint distribution (see below)                   | weighted random |
 | `-log-level LEVEL` | Log level: debug, info, warning, error                     | `info`          |
 
@@ -393,14 +392,14 @@ On both client and server, `-dnstt-compat` switches to the original dnstt wire f
 | Setting | VayDNS default | With `-dnstt-compat` | Applies to |
 | ------- | -------------- | -------------------- | ---------- |
 | `-max-qname-len` | `101` | `253` | client |
-| `-idle-timeout` | `60s` | `2m` | client and server |
-| `-keepalive` | `10s` | `10s` | client and server |
+| `-idle-timeout` | `10s` | `2m` | client and server |
+| `-keepalive` | `2s` | `10s` | client and server |
 
 All three can be explicitly overridden even when `-dnstt-compat` is set — the flag only changes the defaults, it does not lock the values. For example, `-dnstt-compat -idle-timeout 30s` uses the dnstt wire format with a 30-second idle timeout.
 
 > **Note:** `-dnstt-compat` forces `-record-type` to `txt` (with a warning if another type was set). dnstt only supports TXT records, so other record types are incompatible.
 >
-> The timeout defaults are critical for interop with original dnstt binaries. dnstt uses a 10-second keepalive interval (smux default) and a 2-minute idle timeout. Setting `-idle-timeout` below 10s in compat mode will cause sessions to churn because dnstt peers only send keepalives every 10 seconds. When mixing with dnstt, keep the compat defaults unless you know what you're doing.
+> The timeout defaults are critical for interop with original dnstt binaries. dnstt uses a 10-second keepalive interval (smux default) and a 2-minute idle timeout. Setting `-idle-timeout` below 10s in compat mode will cause sessions to churn because dnstt peers only send keepalives every 10 seconds. When connecting to dnstt, keep the compat defaults unless you know what you're doing.
 
 ### Record types
 
@@ -409,12 +408,14 @@ VayDNS supports multiple DNS record types for downstream data encoding. Both cli
 | Type | Description | Capacity |
 | ---- | ----------- | -------- |
 | `txt` | TXT record (default). Highest capacity, compatible with dnstt. | Bounded by UDP payload (~1200 bytes) |
+| `null` | NULL record. Raw binary payload in a single RR. Some recursive resolvers may filter or refuse to relay NULL records. | Bounded by UDP payload |
 | `cname` | CNAME record. Data encoded as a DNS name under the tunnel domain. | Bounded by 255-byte DNS name limit |
 | `ns` | NS record. Same encoding as CNAME. | Same as CNAME |
 | `mx` | MX record. 2-byte preference header + name encoding. | Same as CNAME |
 | `srv` | SRV record. 6-byte header + name encoding. | Same as CNAME |
 | `a` | A records. Data split into 4-byte chunks across multiple answer RRs. | Bounded by UDP payload |
 | `aaaa` | AAAA records. Data split into 16-byte chunks across multiple answer RRs. | Bounded by UDP payload |
+| `caa` | CAA record. Payload encoded in the value portion of a fixed `issue` property. | Bounded by UDP payload |
 
 > **Compatibility:** Old VayDNS clients (pre-record-type) only send TXT queries. A new server with the default `-record-type txt` is fully compatible with old clients. Using a non-TXT type requires updating both client and server.
 
