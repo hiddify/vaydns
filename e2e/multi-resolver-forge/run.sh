@@ -41,6 +41,21 @@ for i in $(seq 1 60); do
             fi
             nxdomain_count=$(grep -c 'NXDOMAIN' <<<"$forge_logs" || true)
             echo "--- dns-forge served $nxdomain_count NXDOMAIN responses; forging path exercised ---"
+
+            # Verify the client-side milestone log fired with per-resolver
+            # attribution: "forged DNS responses from <dns-forge-ip>: ..."
+            # This proves the ForgedStats plumbing carries the resolver
+            # label end-to-end and that milestone thresholds fire correctly
+            # in multi-resolver mode.
+            client_logs=$(docker compose logs client 2>&1)
+            if ! grep -q 'forged DNS responses from 172.28.0.11' <<<"$client_logs"; then
+                echo "--- Client did not log labeled forged milestone for dns-forge (172.28.0.11) ---"
+                echo "$client_logs" | tail -30
+                echo "=== FAIL (missing per-resolver forged milestone log) ==="
+                exit 1
+            fi
+            milestone_line=$(grep 'forged DNS responses from 172.28.0.11' <<<"$client_logs" | tail -1)
+            echo "--- Client milestone: $milestone_line ---"
             echo "--- Tunnel delivers consistent responses despite forged NXDOMAINs ---"
             echo "=== PASS ==="
             exit 0

@@ -33,23 +33,28 @@ type UDPPacketConn struct {
 }
 
 // NewUDPPacketConn creates a UDPPacketConn with numWorkers goroutines that
-// each send one query at a time on a fresh UDP socket. The returned
-// ForgedStats pointer is shared with the caller so DNSPacketConn can
-// include per-query forged counts in its reporting.
-func NewUDPPacketConn(remoteAddr net.Addr, dialerControl func(network, address string, c syscall.RawConn) error, numWorkers int, responseTimeout time.Duration, ignoreErrors bool, queueSize int, overflowMode turbotunnel.QueueOverflowMode) (*UDPPacketConn, *ForgedStats, error) {
-	stats := &ForgedStats{}
+// each send one query at a time on a fresh UDP socket. If forgedStats is
+// non-nil, the UDPPacketConn records forged-response counts into it;
+// otherwise a new instance is created internally (labeled with the remote
+// address). Callers that want unified milestone logging across layers
+// should create a single ForgedStats and pass the same pointer here and
+// to NewDNSPacketConn.
+func NewUDPPacketConn(remoteAddr net.Addr, dialerControl func(network, address string, c syscall.RawConn) error, numWorkers int, responseTimeout time.Duration, ignoreErrors bool, queueSize int, overflowMode turbotunnel.QueueOverflowMode, forgedStats *ForgedStats) (*UDPPacketConn, error) {
+	if forgedStats == nil {
+		forgedStats = &ForgedStats{Label: remoteAddr.String()}
+	}
 	pconn := &UDPPacketConn{
 		remoteAddr:      remoteAddr,
 		dialerControl:   dialerControl,
 		responseTimeout: responseTimeout,
 		ignoreErrors:    ignoreErrors,
-		forgedStats:     stats,
+		forgedStats:     forgedStats,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(remoteAddr, 0, queueSize, overflowMode),
 	}
 	for i := 0; i < numWorkers; i++ {
 		go pconn.sendLoop()
 	}
-	return pconn, stats, nil
+	return pconn, nil
 }
 
 // sendLoop is the per-worker loop. It dequeues one packet at a time from the

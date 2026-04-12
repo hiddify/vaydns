@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/net2share/vaydns/dns"
 	"github.com/net2share/vaydns/turbotunnel"
 )
 
@@ -76,11 +78,12 @@ func (f *fakePacketConn) SetWriteDeadline(time.Time) error { return nil }
 // injection into a hand-constructed MultiResolver in tests.
 func newFakeEntry(name string, conn *fakePacketConn) *resolverEntry {
 	return &resolverEntry{
-		name:    name,
-		addr:    turbotunnel.DummyAddr{},
-		conn:    conn,
-		pending: make(map[uint16]time.Time),
-		state:   ResolverStateUnknown,
+		name:        name,
+		addr:        turbotunnel.DummyAddr{},
+		conn:        conn,
+		forgedStats: &ForgedStats{Label: name},
+		pending:     make(map[uint16]time.Time),
+		state:       ResolverStateUnknown,
 	}
 }
 
@@ -225,5 +228,167 @@ drain:
 		if selected.name == "failing" {
 			t.Fatalf("iter %d: selectPrimary returned the failed entry %q; expected it to be excluded after its reader exited on error. State is %s.", i, selected.name, selected.stateSnapshot())
 		}
+	}
+}
+
+// buildDNSResponse constructs a minimal valid DNS wire-format response with
+// the given RCODE. QR is set to 1. This is the smallest packet that
+// dns.MessageFromWireFormat can parse and isValidDNSResponse/isRateLimitedResponse
+// can classify.
+func buildDNSResponse(t *testing.T, rcode uint16) []byte {
+	t.Helper()
+	msg := &dns.Message{
+		ID:    0x1234,
+		Flags: 0x8000 | rcode, // QR=1 + RCODE
+	}
+	buf, err := msg.WireFormat()
+	if err != nil {
+		t.Fatalf("buildDNSResponse: %v", err)
+	}
+	return buf
+}
+
+// TestForgedStats_LabeledMilestoneLog verifies that ForgedStats.Record()
+// fires a milestone log at the expected thresholds and that the log line
+// includes the resolver label in the "from <addr>" format.
+func TestForgedStats_LabeledMilestoneLog(t *testing.T) {
+	stats := &ForgedStats{Label: "1.2.3.4:53"}
+
+	// Record 9 forged NXDOMAIN responses — no milestone yet.
+	for range 9 {
+		stats.Record(dns.RcodeNameError)
+	}
+	if atomic.LoadUint64(&stats.Total) != 9 {
+		t.Fatalf("expected Total=9, got %d", stats.Total)
+	}
+
+	// The 10th should trigger the first milestone.
+	stats.Record(dns.RcodeNameError)
+	if atomic.LoadUint64(&stats.Total) != 10 {
+		t.Fatalf("expected Total=10, got %d", stats.Total)
+	}
+	if atomic.LoadUint64(&stats.NXDOMAIN) != 10 {
+		t.Fatalf("expected NXDOMAIN=10, got %d", stats.NXDOMAIN)
+	}
+}
+
+// TestForgedStats_UnlabeledFallback verifies that a ForgedStats with an
+// empty Label still records correctly (used by DNSPacketConn's catch-all).
+func TestForgedStats_UnlabeledFallback(t *testing.T) {
+	stats := &ForgedStats{}
+	stats.Record(dns.RcodeServerFailure)
+	if atomic.LoadUint64(&stats.Total) != 1 {
+		t.Fatalf("expected Total=1, got %d", stats.Total)
+	}
+	if atomic.LoadUint64(&stats.SERVFAIL) != 1 {
+		t.Fatalf("expected SERVFAIL=1, got %d", stats.SERVFAIL)
+	}
+}
+
+// TestMultiResolver_ForgedResponseRecordedPerEntry verifies that in
+// multi-resolver mode, a forged DNS response (NXDOMAIN) arriving at one
+// entry increments that entry's ForgedStats but not the other entries'.
+func TestMultiResolver_ForgedResponseRecordedPerEntry(t *testing.T) {
+	forging := newFakePacketConn("forging")
+	clean := newFakePacketConn("clean")
+
+	forgingEntry := newFakeEntry("forging", forging)
+	cleanEntry := newFakeEntry("clean", clean)
+
+	mr := newTestMultiResolver([]*resolverEntry{forgingEntry, cleanEntry}, SelectionRoundRobin)
+	defer mr.Close()
+
+	// Push a forged NXDOMAIN response to the forging entry.
+	forgedResp := buildDNSResponse(t, dns.RcodeNameError)
+	forging.pushData(forgedResp)
+
+	// Give the reader time to process.
+	time.Sleep(100 * time.Millisecond)
+
+	// Forging entry's stats should have recorded the forged response.
+	if got := atomic.LoadUint64(&forgingEntry.forgedStats.Total); got != 1 {
+		t.Errorf("forging entry ForgedStats.Total = %d, want 1", got)
+	}
+	if got := atomic.LoadUint64(&forgingEntry.forgedStats.NXDOMAIN); got != 1 {
+		t.Errorf("forging entry ForgedStats.NXDOMAIN = %d, want 1", got)
+	}
+
+	// Clean entry's stats should be untouched.
+	if got := atomic.LoadUint64(&cleanEntry.forgedStats.Total); got != 0 {
+		t.Errorf("clean entry ForgedStats.Total = %d, want 0", got)
+	}
+}
+
+// TestMultiResolver_ForgedResponseNotForwardedToRecvChan verifies that
+// forged responses detected by evaluateIncoming are NOT forwarded to
+// recvChan (and therefore never reach DNSPacketConn). Only legitimate
+// responses should appear on the channel.
+func TestMultiResolver_ForgedResponseNotForwardedToRecvChan(t *testing.T) {
+	conn := newFakePacketConn("resolver")
+	entry := newFakeEntry("resolver", conn)
+
+	mr := newTestMultiResolver([]*resolverEntry{entry}, SelectionRoundRobin)
+	defer mr.Close()
+
+	// Push a forged NXDOMAIN, then a valid NoError response.
+	forgedResp := buildDNSResponse(t, dns.RcodeNameError)
+	validResp := buildDNSResponse(t, dns.RcodeNoError)
+	conn.pushData(forgedResp)
+	conn.pushData(validResp)
+
+	// ReadFrom should return the valid response, skipping the forged one.
+	buf := make([]byte, 4096)
+	type readResult struct {
+		n   int
+		err error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		n, _, err := mr.ReadFrom(buf)
+		done <- readResult{n: n, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("ReadFrom error: %v", r.err)
+		}
+		// The bytes should be the valid response, not the forged one.
+		if bytes.Equal(buf[:r.n], forgedResp) {
+			t.Fatal("ReadFrom returned the forged response — it should have been filtered by the reader goroutine")
+		}
+		if !bytes.Equal(buf[:r.n], validResp) {
+			t.Fatalf("ReadFrom returned unexpected bytes:\n  got:  %x\n  want: %x", buf[:r.n], validResp)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ReadFrom timed out; expected valid response within 3s")
+	}
+
+	// Verify the forged response was recorded.
+	if got := atomic.LoadUint64(&entry.forgedStats.Total); got != 1 {
+		t.Errorf("ForgedStats.Total = %d, want 1", got)
+	}
+}
+
+// TestMultiResolver_ForgedStatsPerEntryLabeled verifies that each entry
+// in a MultiResolver carries a distinctly-labeled ForgedStats instance.
+func TestMultiResolver_ForgedStatsPerEntryLabeled(t *testing.T) {
+	conn1 := newFakePacketConn("r1")
+	conn2 := newFakePacketConn("r2")
+
+	e1 := newFakeEntry("1.1.1.1:53", conn1)
+	e2 := newFakeEntry("8.8.8.8:53", conn2)
+
+	mr := newTestMultiResolver([]*resolverEntry{e1, e2}, SelectionRoundRobin)
+	defer mr.Close()
+
+	if e1.forgedStats == e2.forgedStats {
+		t.Fatal("entries share the same ForgedStats pointer; expected distinct per-resolver instances")
+	}
+	if e1.forgedStats.Label != "1.1.1.1:53" {
+		t.Errorf("entry1 label = %q, want %q", e1.forgedStats.Label, "1.1.1.1:53")
+	}
+	if e2.forgedStats.Label != "8.8.8.8:53" {
+		t.Errorf("entry2 label = %q, want %q", e2.forgedStats.Label, "8.8.8.8:53")
 	}
 }

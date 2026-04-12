@@ -100,10 +100,17 @@ func (rl *RateLimiter) Wait() {
 	}
 }
 
-// ForgedStats tracks forged DNS response counters. It is shared between
-// UDPPacketConn (per-query mode) and DNSPacketConn (shared socket mode) so
-// that forged response visibility is consistent regardless of transport.
+// ForgedStats tracks forged DNS response counters for a specific source.
+// In single-resolver mode, one instance is shared between UDPPacketConn
+// (per-query mode) and DNSPacketConn so milestone logs fire on a unified
+// count. In multi-resolver mode, each entry holds its own labeled instance
+// so operators can see which resolver is being targeted by injection.
 type ForgedStats struct {
+	// Label identifies the counter's source in log lines — typically the
+	// resolver address (e.g. "8.8.8.8:53"). An empty label is allowed
+	// and produces an unlabeled log line (used by DNSPacketConn's catch-all
+	// safety net when no resolver attribution is available).
+	Label    string
 	Total    uint64
 	SERVFAIL uint64
 	NXDOMAIN uint64
@@ -124,11 +131,19 @@ func (s *ForgedStats) Record(rcode uint16) {
 	}
 	total := atomic.AddUint64(&s.Total, 1)
 	if forgedInfoMilestone(total) {
-		log.Infof("forged DNS responses: total=%d, SERVFAIL=%d, NXDOMAIN=%d, other=%d",
-			total,
-			atomic.LoadUint64(&s.SERVFAIL),
-			atomic.LoadUint64(&s.NXDOMAIN),
-			atomic.LoadUint64(&s.Other))
+		if s.Label != "" {
+			log.Infof("forged DNS responses from %s: total=%d, SERVFAIL=%d, NXDOMAIN=%d, other=%d",
+				s.Label, total,
+				atomic.LoadUint64(&s.SERVFAIL),
+				atomic.LoadUint64(&s.NXDOMAIN),
+				atomic.LoadUint64(&s.Other))
+		} else {
+			log.Infof("forged DNS responses: total=%d, SERVFAIL=%d, NXDOMAIN=%d, other=%d",
+				total,
+				atomic.LoadUint64(&s.SERVFAIL),
+				atomic.LoadUint64(&s.NXDOMAIN),
+				atomic.LoadUint64(&s.Other))
+		}
 	}
 }
 

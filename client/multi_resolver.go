@@ -70,6 +70,13 @@ type resolverEntry struct {
 	// can read it without acquiring mu on the hot path.
 	dead atomic.Bool
 
+	// forgedStats tracks forged DNS response counters for this specific
+	// resolver entry, with milestone logging attributed to its address.
+	// In multi-resolver mode each entry owns its own labeled instance;
+	// in single-resolver mode the Tunnel shares one instance with both
+	// UDPPacketConn and DNSPacketConn.
+	forgedStats *ForgedStats
+
 	// mu protects every field below. Counters are deliberately not atomic:
 	// the decay path in recomputeState would lose concurrent Adds if the
 	// counters were atomic and decremented via Load→Store, and splitting
@@ -134,17 +141,22 @@ func (e *resolverEntry) trackOutgoingID(b []byte, now time.Time) {
 	e.mu.Unlock()
 }
 
-func (e *resolverEntry) readPacket() multiReadResult {
+func (e *resolverEntry) readPacket() (multiReadResult, bool) {
 	var result multiReadResult
 	result.entry = e
 	result.n, result.addr, result.err = e.conn.ReadFrom(result.buf[:])
+	var forged bool
 	if result.err == nil {
-		e.evaluateIncoming(result.buf[:result.n])
+		forged = e.evaluateIncoming(result.buf[:result.n])
 	}
-	return result
+	return result, forged
 }
 
-func (e *resolverEntry) evaluateIncoming(packet []byte) {
+// evaluateIncoming parses an incoming DNS response for health tracking and
+// forged-response detection. Returns true when the response is forged
+// (QR=1, RCODE != NoError) — the caller should not forward it upstream
+// because evaluateIncoming already recorded it in the entry's ForgedStats.
+func (e *resolverEntry) evaluateIncoming(packet []byte) bool {
 	now := time.Now()
 	resp, err := dns.MessageFromWireFormat(packet)
 	if err != nil {
@@ -152,7 +164,7 @@ func (e *resolverEntry) evaluateIncoming(packet []byte) {
 		e.invalidCount++
 		e.mu.Unlock()
 		e.recomputeState(now)
-		return
+		return false // parse error — not forged, let upper layer handle
 	}
 
 	if isValidDNSResponse(resp) {
@@ -163,8 +175,12 @@ func (e *resolverEntry) evaluateIncoming(packet []byte) {
 		e.lastValid = now
 		e.state = ResolverStateHealthy
 		e.mu.Unlock()
-		return
+		return false
 	}
+
+	// Non-valid DNS response. Track it for health purposes.
+	rcode := resp.Flags & 0x000f
+	isResponse := resp.Flags&0x8000 != 0
 
 	e.mu.Lock()
 	delete(e.pending, resp.ID)
@@ -174,6 +190,13 @@ func (e *resolverEntry) evaluateIncoming(packet []byte) {
 	}
 	e.mu.Unlock()
 	e.recomputeState(now)
+
+	// Record in per-resolver forged stats and signal caller not to forward.
+	if isResponse && e.forgedStats != nil {
+		e.forgedStats.Record(rcode)
+		return true
+	}
+	return false
 }
 
 func (e *resolverEntry) expirePending(now time.Time) {
@@ -300,7 +323,8 @@ func NewMultiResolver(resolvers []Resolver, mode SelectionMode, queueSize int, o
 
 	entries := make([]*resolverEntry, 0, len(resolvers))
 	for _, r := range resolvers {
-		conn, addr, err := GetResolverConnection(r, queueSize, overflowMode)
+		entryStats := &ForgedStats{Label: r.ResolverAddr}
+		conn, addr, err := GetResolverConnection(r, queueSize, overflowMode, entryStats)
 		if err != nil {
 			for _, e := range entries {
 				e.conn.Close()
@@ -308,11 +332,12 @@ func NewMultiResolver(resolvers []Resolver, mode SelectionMode, queueSize int, o
 			return nil, fmt.Errorf("resolver %s %s: %w", r.ResolverType, r.ResolverAddr, err)
 		}
 		entries = append(entries, &resolverEntry{
-			name:    r.ResolverAddr,
-			addr:    addr,
-			conn:    conn,
-			pending: make(map[uint16]time.Time),
-			state:   ResolverStateUnknown,
+			name:        r.ResolverAddr,
+			addr:        addr,
+			conn:        conn,
+			forgedStats: entryStats,
+			pending:     make(map[uint16]time.Time),
+			state:       ResolverStateUnknown,
 		})
 	}
 
@@ -359,10 +384,17 @@ func (mr *MultiResolver) startReaders() {
 		entry := e
 		go func() {
 			for {
-				res := entry.readPacket()
+				res, forged := entry.readPacket()
 				if res.err != nil {
 					mr.entryDied(entry, res.err)
 					return
+				}
+				if forged {
+					// evaluateIncoming already recorded this in the
+					// entry's per-resolver ForgedStats. Don't forward
+					// to DNSPacketConn — its safety-net filter would
+					// double-count it.
+					continue
 				}
 				select {
 				case mr.recvChan <- res:
@@ -681,8 +713,11 @@ func (mr *MultiResolver) SetWriteDeadline(t time.Time) error {
 	return last
 }
 
-// getResolverConnection creates the underlying transport net.PacketConn for r.
-func GetResolverConnection(r Resolver, queueSize int, overflowMode turbotunnel.QueueOverflowMode) (net.PacketConn, net.Addr, error) {
+// GetResolverConnection creates the underlying transport net.PacketConn for r.
+// For UDP per-query mode, forgedStats is passed to NewUDPPacketConn so
+// forged-response milestone logs are attributed to this resolver. Callers
+// may pass nil to let each layer create its own counter.
+func GetResolverConnection(r Resolver, queueSize int, overflowMode turbotunnel.QueueOverflowMode, forgedStats *ForgedStats) (net.PacketConn, net.Addr, error) {
 	switch r.ResolverType {
 	case ResolverTypeUDP:
 		addr, err := net.ResolveUDPAddr("udp", r.ResolverAddr)
@@ -705,7 +740,7 @@ func GetResolverConnection(r Resolver, queueSize int, overflowMode turbotunnel.Q
 		if timeout <= 0 {
 			timeout = DefaultUDPResponseTimeout
 		}
-		conn, _, err := NewUDPPacketConn(addr, r.DialerControl, workers, timeout, !r.UDPAcceptErrors, queueSize, overflowMode)
+		conn, err := NewUDPPacketConn(addr, r.DialerControl, workers, timeout, !r.UDPAcceptErrors, queueSize, overflowMode, forgedStats)
 		if err != nil {
 			return nil, nil, err
 		}

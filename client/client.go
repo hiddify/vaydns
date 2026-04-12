@@ -298,9 +298,15 @@ func (t *Tunnel) InitiateResolverConnection() error {
 		}
 		t.resolverConn = conn
 		t.remoteAddr = turbotunnel.DummyAddr{}
+		// In multi-resolver mode, each entry owns a per-resolver
+		// ForgedStats. t.forgedStats stays nil so DNSPacketConn
+		// creates an unlabeled catch-all (which should rarely fire
+		// since MultiResolver filters forged responses upstream).
 		return nil
 	}
-	conn, addr, err := GetResolverConnection(t.Resolvers[0], t.effectivePacketQueueSize(), t.effectiveQueueOverflowMode())
+	r := t.Resolvers[0]
+	t.forgedStats = &ForgedStats{Label: r.ResolverAddr}
+	conn, addr, err := GetResolverConnection(r, t.effectivePacketQueueSize(), t.effectiveQueueOverflowMode(), t.forgedStats)
 	if err != nil {
 		return err
 	}
