@@ -308,7 +308,7 @@ func (t *Tunnel) effectiveKCPWindowSize() int {
 // based on the Resolver configuration.
 func (t *Tunnel) InitiateResolverConnection() error {
 	if len(t.Resolvers) > 1 {
-		conn, err := NewMultiResolver(t.Resolvers, SelectionRoundRobin, t.effectivePacketQueueSize(), t.effectiveQueueOverflowMode())
+		conn, err := NewMultiResolver(t.Resolvers, t.effectivePacketQueueSize(), t.effectiveQueueOverflowMode())
 		if err != nil {
 			return err
 		}
@@ -863,7 +863,6 @@ func NewOutbound(resolvers []Resolver, tunnelServers []TunnelServer) *Outbound {
 // Start begins accepting connections on bind and forwarding them through the
 // first resolver/server pair.
 func (o *Outbound) Start(bind string) error {
-
 	tunnelServer := o.TunnelServers[0]
 
 	tunnel, err := NewTunnelMulti(o.Resolvers, tunnelServer)

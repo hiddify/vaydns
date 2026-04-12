@@ -16,18 +16,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// SelectionMode controls which resolver MultiResolver picks for outgoing packets.
-type SelectionMode string
-
-const (
-	// SelectionRoundRobin rotates through preferred resolvers in order.
-	SelectionRoundRobin SelectionMode = "roundrobin"
-	// SelectionBest picks the resolver with the best observed score.
-	SelectionBest SelectionMode = "best"
-	// SelectionSmart currently aliases best-score selection.
-	SelectionSmart SelectionMode = "smart"
-)
-
 // ResolverState is the current health state of one resolver.
 type ResolverState string
 
@@ -301,7 +289,6 @@ type multiReadResult struct {
 // unhealthy resolvers by duplicating selected packets.
 type MultiResolver struct {
 	entries   []*resolverEntry
-	mode      SelectionMode
 	mu        sync.Mutex
 	rrIndex   int
 	probeRR   int
@@ -320,7 +307,7 @@ type MultiResolver struct {
 }
 
 // NewMultiResolver creates a MultiResolver from a slice of Resolver configs.
-func NewMultiResolver(resolvers []Resolver, mode SelectionMode, queueSize int, overflowMode turbotunnel.QueueOverflowMode) (*MultiResolver, error) {
+func NewMultiResolver(resolvers []Resolver, queueSize int, overflowMode turbotunnel.QueueOverflowMode) (*MultiResolver, error) {
 	if len(resolvers) == 0 {
 		return nil, fmt.Errorf("at least one resolver is required")
 	}
@@ -345,9 +332,24 @@ func NewMultiResolver(resolvers []Resolver, mode SelectionMode, queueSize int, o
 		})
 	}
 
+	log.Infof("multi-resolver: %d resolvers configured", len(entries))
+	udpWorkerTotal := 0
+	for i, r := range resolvers {
+		log.Infof("  [%d] %s %s", i+1, r.ResolverType, r.ResolverAddr)
+		if r.ResolverType == ResolverTypeUDP && !r.UDPSharedSocket {
+			workers := r.UDPWorkers
+			if workers <= 0 {
+				workers = DefaultUDPWorkers
+			}
+			udpWorkerTotal += workers
+		}
+	}
+	if udpWorkerTotal > 0 {
+		log.Infof("multi-resolver: %d total UDP worker goroutines", udpWorkerTotal)
+	}
+
 	mr := &MultiResolver{
 		entries:  entries,
-		mode:     mode,
 		recvChan: make(chan multiReadResult, len(entries)*4),
 		closed:   make(chan struct{}),
 		allDead:  make(chan struct{}),
@@ -543,12 +545,6 @@ func (mr *MultiResolver) WriteTo(b []byte, _ net.Addr) (n int, err error) {
 // query, or nil if every entry has been marked dead. The caller must handle
 // nil (e.g., return an "all resolvers down" error).
 func (mr *MultiResolver) selectPrimary() *resolverEntry {
-	if mr.mode == SelectionRoundRobin {
-		return mr.selectRoundRobinHealthy()
-	}
-	if e := mr.selectBestScore(); e != nil {
-		return e
-	}
 	return mr.selectRoundRobinHealthy()
 }
 
@@ -584,42 +580,6 @@ func (mr *MultiResolver) selectRoundRobinHealthy() *resolverEntry {
 	}
 	// Every entry is dead.
 	return nil
-}
-
-func (mr *MultiResolver) selectBestScore() *resolverEntry {
-	if len(mr.entries) == 0 {
-		return nil
-	}
-	var best *resolverEntry
-	var bestScore int64
-	for _, e := range mr.entries {
-		if e.isDead() {
-			continue
-		}
-		s := resolverScore(e)
-		if best == nil || s > bestScore {
-			best = e
-			bestScore = s
-		}
-	}
-	return best
-}
-
-func resolverScore(e *resolverEntry) int64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	var statePenalty int64
-	switch e.state {
-	case ResolverStateHealthy:
-		statePenalty = 0
-	case ResolverStateUnknown:
-		statePenalty = 5
-	case ResolverStateRateLimited:
-		statePenalty = 15
-	case ResolverStateDown:
-		statePenalty = 30
-	}
-	return e.validCount*4 - e.invalidCount*2 - e.timeoutCount*3 - statePenalty
 }
 
 func (mr *MultiResolver) selectProbeTarget(primary *resolverEntry) *resolverEntry {
@@ -680,6 +640,9 @@ func (mr *MultiResolver) Close() error {
 }
 
 // LocalAddr returns the local address of the first underlying connection.
+// The value is arbitrary (there is no single meaningful local address for a
+// multi-resolver), but the method must exist to satisfy net.PacketConn.
+// No caller uses the returned address for routing or logic decisions.
 func (mr *MultiResolver) LocalAddr() net.Addr {
 	return mr.entries[0].conn.LocalAddr()
 }

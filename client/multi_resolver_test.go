@@ -91,10 +91,9 @@ func newFakeEntry(name string, conn *fakePacketConn) *resolverEntry {
 // GetResolverConnection returns, but with pre-built synthetic entries. It does
 // not spawn the healthWorker — tests don't need it, and omitting it keeps them
 // hermetic with respect to timing.
-func newTestMultiResolver(entries []*resolverEntry, mode SelectionMode) *MultiResolver {
+func newTestMultiResolver(entries []*resolverEntry) *MultiResolver {
 	mr := &MultiResolver{
 		entries:  entries,
-		mode:     mode,
 		recvChan: make(chan multiReadResult, len(entries)*4),
 		closed:   make(chan struct{}),
 		allDead:  make(chan struct{}),
@@ -117,7 +116,7 @@ func TestMultiResolver_DeadEntryDoesNotBreakReadFrom(t *testing.T) {
 		newFakeEntry("failing", failing),
 		newFakeEntry("working", working),
 	}
-	mr := newTestMultiResolver(entries, SelectionRoundRobin)
+	mr := newTestMultiResolver(entries)
 	defer mr.Close()
 
 	// Step 1: make the failing entry's ReadFrom return a fatal error.
@@ -176,7 +175,7 @@ func TestMultiResolver_FailedEntryExcludedFromSelection(t *testing.T) {
 		newFakeEntry("failing", failing),
 		newFakeEntry("working", working),
 	}
-	mr := newTestMultiResolver(entries, SelectionRoundRobin)
+	mr := newTestMultiResolver(entries)
 	defer mr.Close()
 
 	// Kill the failing entry's reader; leave working blocked in ReadFrom.
@@ -275,7 +274,7 @@ func TestMultiResolver_ForgedResponseRecordedPerEntry(t *testing.T) {
 	forgingEntry := newFakeEntry("forging", forging)
 	cleanEntry := newFakeEntry("clean", clean)
 
-	mr := newTestMultiResolver([]*resolverEntry{forgingEntry, cleanEntry}, SelectionRoundRobin)
+	mr := newTestMultiResolver([]*resolverEntry{forgingEntry, cleanEntry})
 	defer mr.Close()
 
 	// Push a forged NXDOMAIN response to the forging entry.
@@ -307,7 +306,7 @@ func TestMultiResolver_ForgedResponseNotForwardedToRecvChan(t *testing.T) {
 	conn := newFakePacketConn("resolver")
 	entry := newFakeEntry("resolver", conn)
 
-	mr := newTestMultiResolver([]*resolverEntry{entry}, SelectionRoundRobin)
+	mr := newTestMultiResolver([]*resolverEntry{entry})
 	defer mr.Close()
 
 	// Push a forged NXDOMAIN, then a valid NoError response.
@@ -359,7 +358,7 @@ func TestMultiResolver_ForgedStatsPerEntryLabeled(t *testing.T) {
 	e1 := newFakeEntry("1.1.1.1:53", conn1)
 	e2 := newFakeEntry("8.8.8.8:53", conn2)
 
-	mr := newTestMultiResolver([]*resolverEntry{e1, e2}, SelectionRoundRobin)
+	mr := newTestMultiResolver([]*resolverEntry{e1, e2})
 	defer mr.Close()
 
 	if e1.forgedStats == e2.forgedStats {
