@@ -211,6 +211,18 @@ func (e *resolverEntry) expirePending(now time.Time) {
 	if expired > 0 {
 		e.timeoutCount += expired
 		e.invalidCount += expired
+	} else {
+		// Decay counters only when nothing accumulated this tick.
+		// This ensures burst expirations (and response-driven
+		// invalidCount growth between ticks) can outpace the decay
+		// and eventually cross the detection thresholds. Decay runs
+		// at most once per health-tick interval (~1s).
+		if e.invalidCount > 0 {
+			e.invalidCount--
+		}
+		if e.timeoutCount > 0 {
+			e.timeoutCount--
+		}
 	}
 	e.mu.Unlock()
 	e.recomputeState(now)
@@ -240,14 +252,6 @@ func (e *resolverEntry) recomputeState(now time.Time) {
 		e.state = ResolverStateUnknown
 	default:
 		e.state = ResolverStateUnknown
-	}
-
-	// Slow decay to avoid sticky penalties.
-	if e.invalidCount > 0 {
-		e.invalidCount--
-	}
-	if e.timeoutCount > 0 {
-		e.timeoutCount--
 	}
 }
 

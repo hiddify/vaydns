@@ -104,19 +104,11 @@ func newTestMultiResolver(entries []*resolverEntry, mode SelectionMode) *MultiRe
 	return mr
 }
 
-// TestMultiResolver_DeadEntryDoesNotBreakReadFrom exercises C1: when one
+// TestMultiResolver_DeadEntryDoesNotBreakReadFrom verifies that when one
 // resolver entry's transport returns a fatal read error, MultiResolver.ReadFrom
-// must continue to deliver packets from healthy entries instead of propagating
+// continues to deliver packets from healthy entries instead of propagating
 // that error to the upper DNSPacketConn layer (which would tear down the whole
 // tunnel session).
-//
-// Pre-fix expectation: this test FAILS — the reader goroutine pushes the error
-// onto recvChan, ReadFrom returns it, and the test sees net.ErrClosed instead
-// of the bytes from the working entry.
-//
-// Post-fix expectation: this test PASSES — the reader goroutine handles the
-// error internally (e.g. marks the entry Down and exits), leaving recvChan to
-// deliver only real response bytes from the surviving entries.
 func TestMultiResolver_DeadEntryDoesNotBreakReadFrom(t *testing.T) {
 	failing := newFakePacketConn("failing")
 	working := newFakePacketConn("working")
@@ -171,20 +163,11 @@ func TestMultiResolver_DeadEntryDoesNotBreakReadFrom(t *testing.T) {
 	}
 }
 
-// TestMultiResolver_FailedEntryExcludedFromSelection exercises the selection
-// side of C1: after a reader goroutine has processed a fatal read error and
-// exited, the entry must no longer be returned by selectPrimary. Otherwise
-// the round-robin scheduler will keep sending queries to a resolver whose
-// reader goroutine is gone (so responses will never come back), defeating the
-// health state machine.
-//
-// Pre-fix expectation: this test FAILS — the reader goroutine exits without
-// updating the entry's state, so it remains ResolverStateUnknown, which
-// selectRoundRobinHealthy treats as an acceptable target. The "failing" entry
-// is returned roughly half the time.
-//
-// Post-fix expectation: this test PASSES — the reader goroutine transitions
-// the entry to ResolverStateDown before exiting, and selectPrimary skips it.
+// TestMultiResolver_FailedEntryExcludedFromSelection verifies that after a
+// reader goroutine has processed a fatal read error and exited, the entry
+// is no longer returned by selectPrimary. Otherwise the round-robin scheduler
+// would keep sending queries to a resolver whose reader goroutine is gone
+// (so responses would never come back).
 func TestMultiResolver_FailedEntryExcludedFromSelection(t *testing.T) {
 	failing := newFakePacketConn("failing")
 	working := newFakePacketConn("working")
@@ -203,11 +186,8 @@ func TestMultiResolver_FailedEntryExcludedFromSelection(t *testing.T) {
 	// entry down before it exits.
 	time.Sleep(100 * time.Millisecond)
 
-	// Drain any error result that the buggy reader may have pushed onto
-	// recvChan. A correct reader wouldn't push anything here, so this
-	// drain is a no-op post-fix. Without it, the buggy pre-fix state
-	// machine would leave an error lingering, which isn't what this
-	// specific assertion is about.
+	// Drain any stale result from recvChan so the assertion below only
+	// checks selectPrimary behaviour, not lingering channel contents.
 drain:
 	for {
 		select {
