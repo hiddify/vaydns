@@ -173,13 +173,18 @@ func (e *resolverEntry) evaluateIncoming(packet []byte) bool {
 	e.mu.Lock()
 	delete(e.pending, resp.ID)
 	e.invalidCount++
-	if isRateLimitedResponse(resp) {
-		e.state = ResolverStateRateLimited
-	}
+	// Rate-limit classification is handled by the accumulation path in
+	// recomputeState (invalidCount >= threshold && validCount == 0), not
+	// by a direct state assignment here. recomputeState unconditionally
+	// reassigns e.state, so any direct assignment would be immediately
+	// overwritten.
 	e.mu.Unlock()
 	e.recomputeState(now)
 
 	// Record in per-resolver forged stats and signal caller not to forward.
+	// forgedStats is always non-nil in multi-resolver mode (set at entry
+	// construction). The nil guard is defensive for any future caller that
+	// constructs a resolverEntry without setting forgedStats.
 	if isResponse && e.forgedStats != nil {
 		e.forgedStats.Record(rcode)
 		return true
@@ -424,7 +429,7 @@ func (mr *MultiResolver) healthWorker() {
 				e.expirePending(now)
 				stats = append(stats, e.snapshot())
 			}
-			log.Trace("\n" + renderResolverStatsTable(stats, now))
+			log.Debug("\n" + renderResolverStatsTable(stats, now))
 		case <-mr.closed:
 			return
 		}
@@ -445,7 +450,7 @@ func renderResolverStatsTable(stats []ResolverStat, now time.Time) string {
 		if !s.LastValid.IsZero() {
 			lastValidAgo = now.Sub(s.LastValid).Truncate(time.Second).String()
 		}
-		b.WriteString(fmt.Sprintf("| %-23.23s | %-12s | %6d | %7d | %7d | %11s | %11s |\n",
+		fmt.Fprintf(&b, "| %-23.23s | %-12s | %6d | %7d | %7d | %11s | %11s |\n",
 			s.Address,
 			s.State,
 			s.ValidCount,
@@ -453,7 +458,7 @@ func renderResolverStatsTable(stats []ResolverStat, now time.Time) string {
 			s.TimeoutCount,
 			lastWriteAgo,
 			lastValidAgo,
-		))
+		)
 	}
 	b.WriteString("+-------------------------+--------------+--------+---------+---------+-------------+-------------+")
 	return b.String()
@@ -464,11 +469,6 @@ func isValidDNSResponse(resp dns.Message) bool {
 		return false
 	}
 	return (resp.Flags & 0x000f) == dns.RcodeNoError
-}
-
-func isRateLimitedResponse(resp dns.Message) bool {
-	rcode := resp.Flags & 0x000f
-	return rcode == dns.RcodeRefused || rcode == dns.RcodeServerFailure
 }
 
 // ReadFrom receives a packet from whichever resolver responds first.
@@ -606,26 +606,6 @@ func (mr *MultiResolver) selectProbeTarget(primary *resolverEntry) *resolverEntr
 		}
 	}
 	return nil
-}
-
-// ResolverStats returns current resolver health counters.
-func (mr *MultiResolver) ResolverStats() []ResolverStat {
-	stats := make([]ResolverStat, 0, len(mr.entries))
-	for _, e := range mr.entries {
-		stats = append(stats, e.snapshot())
-	}
-	return stats
-}
-
-// ValidInvalidCounts returns valid/invalid counts by resolver address.
-func (mr *MultiResolver) ValidInvalidCounts() map[string][2]int64 {
-	out := make(map[string][2]int64, len(mr.entries))
-	for _, e := range mr.entries {
-		e.mu.Lock()
-		out[e.name] = [2]int64{e.validCount, e.invalidCount}
-		e.mu.Unlock()
-	}
-	return out
 }
 
 // Close closes all underlying connections and stops the reader goroutines.

@@ -234,6 +234,9 @@ func NewTunnel(resolver Resolver, tunnelServer TunnelServer) (*Tunnel, error) {
 // multiplexes queries across them with health-based routing.
 // Zero-value fields use sensible defaults.
 func NewTunnelMulti(resolvers []Resolver, tunnelServer TunnelServer) (*Tunnel, error) {
+	if len(resolvers) == 0 {
+		return nil, fmt.Errorf("at least one resolver is required")
+	}
 	t := &Tunnel{
 		Resolvers:    resolvers,
 		TunnelServer: tunnelServer,
@@ -550,24 +553,6 @@ func (t *Tunnel) closeTransportLayers() {
 		t.resolverConn = nil
 	}
 	t.forgedStats = nil
-}
-
-// MultiResolverStats returns per-resolver health and count snapshots when the
-// active resolver transport is MultiResolver; otherwise it returns nil.
-func (t *Tunnel) MultiResolverStats() []ResolverStat {
-	if mr, ok := t.resolverConn.(*MultiResolver); ok {
-		return mr.ResolverStats()
-	}
-	return nil
-}
-
-// MultiResolverValidInvalidCounts returns valid/invalid counters per resolver
-// address when the active resolver transport is MultiResolver.
-func (t *Tunnel) MultiResolverValidInvalidCounts() map[string][2]int64 {
-	if mr, ok := t.resolverConn.(*MultiResolver); ok {
-		return mr.ValidInvalidCounts()
-	}
-	return nil
 }
 
 // resetTransportLayers tears down existing transport layers and creates fresh

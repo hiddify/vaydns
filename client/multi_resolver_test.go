@@ -61,7 +61,12 @@ func (f *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (f *fakePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return len(p), nil
+	select {
+	case <-f.closed:
+		return 0, net.ErrClosed
+	default:
+		return len(p), nil
+	}
 }
 
 func (f *fakePacketConn) Close() error {
@@ -212,8 +217,7 @@ drain:
 
 // buildDNSResponse constructs a minimal valid DNS wire-format response with
 // the given RCODE. QR is set to 1. This is the smallest packet that
-// dns.MessageFromWireFormat can parse and isValidDNSResponse/isRateLimitedResponse
-// can classify.
+// dns.MessageFromWireFormat can parse and evaluateIncoming can classify.
 func buildDNSResponse(t *testing.T, rcode uint16) []byte {
 	t.Helper()
 	msg := &dns.Message{
@@ -369,5 +373,43 @@ func TestMultiResolver_ForgedStatsPerEntryLabeled(t *testing.T) {
 	}
 	if e2.forgedStats.Label != "8.8.8.8:53" {
 		t.Errorf("entry2 label = %q, want %q", e2.forgedStats.Label, "8.8.8.8:53")
+	}
+}
+
+// TestMultiResolver_WriteToFailsOverToNextEntry verifies that when the
+// primary entry's transport is closed, WriteTo marks it dead and retries
+// with the next alive entry rather than returning an error.
+func TestMultiResolver_WriteToFailsOverToNextEntry(t *testing.T) {
+	broken := newFakePacketConn("broken")
+	working := newFakePacketConn("working")
+
+	entries := []*resolverEntry{
+		newFakeEntry("broken", broken),
+		newFakeEntry("working", working),
+	}
+	mr := newTestMultiResolver(entries)
+	defer mr.Close()
+
+	// Close the first entry's transport so WriteTo errors on it.
+	broken.Close()
+
+	// Build a minimal DNS query so trackOutgoingID can parse it.
+	query := buildDNSResponse(t, dns.RcodeNoError) // any valid DNS message works
+
+	n, err := mr.WriteTo(query, turbotunnel.DummyAddr{})
+	if err != nil {
+		t.Fatalf("WriteTo returned error %v; expected failover to working entry", err)
+	}
+	if n != len(query) {
+		t.Fatalf("WriteTo wrote %d bytes, want %d", n, len(query))
+	}
+
+	// Verify the broken entry was marked dead.
+	if !entries[0].isDead() {
+		t.Error("broken entry should be marked dead after write failure")
+	}
+	// Verify the working entry is still alive.
+	if entries[1].isDead() {
+		t.Error("working entry should still be alive")
 	}
 }
