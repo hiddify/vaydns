@@ -47,6 +47,21 @@ t.ListenAndServe("127.0.0.1:7000") // blocks, handles reconnection
 
 `ListenAndServe` opens a local TCP listener, creates tunnel sessions with automatic reconnection on failure, and forwards connections through the tunnel.
 
+### Multi-resolver API
+
+Spread DNS queries across multiple resolvers for throughput and resilience:
+
+```go
+r1, _ := client.NewResolver(client.ResolverTypeUDP, "8.8.8.8:53")
+r2, _ := client.NewResolver(client.ResolverTypeDOH, "https://1.1.1.1/dns-query")
+ts, _ := client.NewTunnelServer("t.example.com", "pubkey-hex")
+t, _ := client.NewTunnelMulti([]client.Resolver{r1, r2}, ts)
+
+t.ListenAndServe("127.0.0.1:7000")
+```
+
+`NewTunnelMulti` accepts a slice of resolvers. The client multiplexes queries across them with round-robin selection and health-based routing. Per-resolver forged-response tracking logs which resolver is being targeted by DNS injection.
+
 ## Key types
 
 | Type | Description |
@@ -87,8 +102,8 @@ ts.RPS = 200             // rate limit queries/second
 ts.RecordType = "cname"  // DNS record type for downstream data: txt, null, cname, a, aaaa, mx, ns, srv, caa (default: "txt")
 
 // Session options
-t.IdleTimeout = 60 * time.Second
-t.KeepAlive = 10 * time.Second
+t.IdleTimeout = 10 * time.Second
+t.KeepAlive = 2 * time.Second
 t.OpenStreamTimeout = 10 * time.Second
 t.MaxStreams = 256
 t.SessionCheckInterval = 500 * time.Millisecond

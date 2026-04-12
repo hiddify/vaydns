@@ -389,7 +389,7 @@ Known TLS fingerprints for -utls are:
 	ts.RecordType = recordTypeStr
 
 	// Build tunnel.
-	tunnel, err := client.NewTunnel(resolvers, ts)
+	tunnel, err := client.NewTunnelMulti(resolvers, ts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)

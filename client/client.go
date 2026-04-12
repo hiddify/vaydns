@@ -16,6 +16,14 @@
 //	t.InitiateSmuxSession()
 //	stream, _ := t.OpenStream() // returns net.Conn
 //	defer t.Close()
+//
+// Multi-resolver usage (spread queries across multiple DNS resolvers):
+//
+//	r1, _ := client.NewResolver(client.ResolverTypeUDP, "8.8.8.8:53")
+//	r2, _ := client.NewResolver(client.ResolverTypeDOH, "https://1.1.1.1/dns-query")
+//	ts, _ := client.NewTunnelServer("t.example.com", "pubkey-hex")
+//	t, _ := client.NewTunnelMulti([]client.Resolver{r1, r2}, ts)
+//	t.ListenAndServe("127.0.0.1:7000")
 package client
 
 import (
@@ -215,9 +223,17 @@ type Tunnel struct {
 	remoteAddr    net.Addr
 }
 
-// NewTunnel creates a Tunnel with the given resolver and server configuration.
+// NewTunnel creates a Tunnel with a single resolver and server configuration.
+// For multiple resolvers, use NewTunnelMulti.
+func NewTunnel(resolver Resolver, tunnelServer TunnelServer) (*Tunnel, error) {
+	return NewTunnelMulti([]Resolver{resolver}, tunnelServer)
+}
+
+// NewTunnelMulti creates a Tunnel with multiple resolvers and server
+// configuration. When more than one resolver is provided, the client
+// multiplexes queries across them with health-based routing.
 // Zero-value fields use sensible defaults.
-func NewTunnel(resolvers []Resolver, tunnelServer TunnelServer) (*Tunnel, error) {
+func NewTunnelMulti(resolvers []Resolver, tunnelServer TunnelServer) (*Tunnel, error) {
 	t := &Tunnel{
 		Resolvers:    resolvers,
 		TunnelServer: tunnelServer,
@@ -850,7 +866,7 @@ func (o *Outbound) Start(bind string) error {
 
 	tunnelServer := o.TunnelServers[0]
 
-	tunnel, err := NewTunnel(o.Resolvers, tunnelServer)
+	tunnel, err := NewTunnelMulti(o.Resolvers, tunnelServer)
 	if err != nil {
 		return fmt.Errorf("failed to create tunnel: %w", err)
 	}
